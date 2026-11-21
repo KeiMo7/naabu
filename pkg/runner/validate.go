@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/projectdiscovery/naabu/v2/pkg/diff"
 	"github.com/projectdiscovery/naabu/v2/pkg/port"
 	"github.com/projectdiscovery/naabu/v2/pkg/privileges"
 	"github.com/projectdiscovery/naabu/v2/pkg/scan"
@@ -225,6 +227,51 @@ func (options *Options) ValidateOptions() error {
 			"Add UDP ports with -p u:53,u:123 or similar. Without UDP ports -uP has no effect.")
 	}
 
+	if err := options.validateDiffOptions(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DiffEnabled reports whether any round-over-round diff feature is requested.
+func (options *Options) DiffEnabled() bool {
+	return options.DiffSnapshot != "" || options.DiffBaseline != ""
+}
+
+// validateDiffOptions checks the diff side-layer flags. A missing or unreadable
+// baseline is a hard error: the previous round must be named explicitly rather
+// than silently treated as an empty world (which would make every port look
+// newly opened).
+func (options *Options) validateDiffOptions() error {
+	if options.DiffOutput != "" && options.DiffBaseline == "" {
+		return errors.New("diff-output requires diff-baseline")
+	}
+	if options.DiffBaseline != "" {
+		if !fileutil.FileExists(options.DiffBaseline) {
+			return fmt.Errorf("diff baseline %q does not exist: cannot compare against a missing previous round", options.DiffBaseline)
+		}
+		// Decode once at startup so a corrupt baseline fails before the scan
+		// runs instead of after wasting the whole probe pass.
+		baseline, err := diff.ReadSnapshot(options.DiffBaseline)
+		if err != nil {
+			return err
+		}
+		options.diffBaseline = baseline
+		options.diffBaselinePath = options.DiffBaseline
+	}
+	if options.DiffSnapshot != "" && options.DiffBaseline != "" &&
+		filepath.Clean(options.DiffSnapshot) == filepath.Clean(options.DiffBaseline) {
+		return errors.New("diff-write and diff-baseline must not point at the same file")
+	}
+	if options.DiffOutput != "" {
+		if options.DiffOutput == options.DiffSnapshot && options.DiffSnapshot != "" {
+			return errors.New("diff-output and diff-write must not point at the same file")
+		}
+		if options.DiffOutput == options.DiffBaseline {
+			return errors.New("diff-output and diff-baseline must not point at the same file")
+		}
+	}
 	return nil
 }
 

@@ -109,6 +109,22 @@ type Runner struct {
 	// injection path (-uP). It is nil until one of those features
 	// triggers a successful load.
 	probeDB *fingerprint.ProbeDB
+
+	// scanInterrupted is set when the probe-sending phase ends because the
+	// context was cancelled (SIGINT, max-runtime) rather than finishing every
+	// target. The diff snapshot builder turns targets left unprobed into an
+	// explicit "unknown" host state instead of letting their missing ports read
+	// as confirmed closures.
+	scanInterrupted atomic.Bool
+
+	// diffPlan captures the planned target space and the host-level evidence
+	// gathered during this run. It is only populated when a diff flag is set,
+	// so a normal scan pays nothing for it. It is read only after the scan has
+	// fully settled, from the single main goroutine.
+	diffPlan *diffPlan
+	// diffExcludedIps is the resolved exclude list recorded in the snapshot so
+	// a later round can tell "excluded" from "not scanned".
+	diffExcludedIps []string
 }
 
 type Target struct {
@@ -207,6 +223,10 @@ func NewRunner(options *Options) (*Runner, error) {
 		return nil, err
 	}
 	excludedIps := append(slices.Clone(nonUnicastRanges), userExcludedIps...)
+	runner.diffExcludedIps = slices.Clone(excludedIps)
+	if options.DiffEnabled() {
+		runner.diffPlan = newDiffPlan()
+	}
 
 	excludedIpsNP, err := networkpolicy.New(networkpolicy.Options{
 		DenyList: excludedIps,
@@ -502,6 +522,8 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 	// header and does not suppress IP:port pairs seen in a previous scan.
 	r.csvHeaderOnce = sync.Once{}
 	r.unique = gcache.New[string, struct{}](defaultUniqueCacheSize).LRU().Build()
+	r.scanInterrupted.Store(false)
+	r.resetDiffPlan()
 
 	if privileges.IsPrivileged && r.options.ScanType == SynScan {
 		// Set values if those were specified via cli, errors are fatal
@@ -601,16 +623,17 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 			time.Sleep(time.Duration(r.options.WarmUpTime) * time.Second)
 		}
 
-		if r.options.ShowDeadHosts {
+		if r.options.ShowDeadHosts || r.shouldComputeDeadHosts() {
 			// re-stream the same targets instead of holding every probed ip in
 			// memory; dead hosts are the streamed targets that never responded.
+			// The diff layer needs the same evidence even without -show-dead.
 			r.calculateDeadHosts(targetsV4, targetsv6)
 		}
 
 		// check if we should stop here or continue with full scan
 		if r.options.OnlyHostDiscovery {
 			r.handleOutput(r.scanner.HostDiscoveryResults)
-			return nil
+			return r.runDiff()
 		}
 	}
 	payload := r.options.ConnectPayload
@@ -618,6 +641,7 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 	case r.options.Stream && !r.options.Passive: // stream active
 		showNetworkCapabilities(r.options)
 		r.scanner.ListenHandler.Phase.Set(scan.Scan)
+		parentCtx := ctx
 		ctx, stopScan := r.withMaxRuntime(ctx)
 		defer stopScan()
 
@@ -660,6 +684,10 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 				if err := r.scanner.IPRanger.Add(target.Cidr); err != nil {
 					gologger.Warning().Msgf("Couldn't track %s in scan results: %s\n", target, err)
 				}
+				r.addPlannedTarget(target.Cidr)
+				if target.Ip != "" {
+					r.addPlannedTarget(target.Ip)
+				}
 				stopped, err := eachCIDRAddress(ctx, target.Cidr, func(ip string) bool {
 					for _, port := range r.scanner.Ports {
 						if ctx.Err() != nil {
@@ -689,12 +717,13 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 		}
 		r.wgscan.Wait()
 		stopScan()
+		r.markInterrupted(ctx, parentCtx)
 
 		time.Sleep(time.Duration(r.options.WarmUpTime) * time.Second)
 
 		r.waitServiceDetection(r.scanner.ScanResults)
 		r.handleOutput(r.scanner.ScanResults)
-		return nil
+		return r.runDiff()
 	case r.options.Stream && r.options.Passive: // stream passive
 		showNetworkCapabilities(r.options)
 		// create retryablehttp instance
@@ -780,7 +809,7 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 
 		// then handle output with enhanced service information
 		r.handleOutput(r.scanner.ScanResults)
-		return nil
+		return r.runDiff()
 	default:
 		showNetworkCapabilities(r.options)
 
@@ -798,6 +827,7 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		r.recordPlannedTargets(targetsV4, targetsv6, targetsWithPort)
 		var targetsCount, portsCount, targetsWithPortCount uint64
 		for _, target := range append(targetsV4, targetsv6...) {
 			if target == nil {
@@ -809,6 +839,7 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 		targetsWithPortCount = uint64(len(targetsWithPort))
 
 		r.scanner.ListenHandler.Phase.Set(scan.Scan)
+		parentCtx := ctx
 		ctx, stopScan := r.withMaxRuntime(ctx)
 		defer stopScan()
 
@@ -1116,7 +1147,8 @@ func (r *Runner) RunEnumeration(pctx context.Context) error {
 
 		// then handle output with enhanced service information
 		r.handleOutput(r.scanner.ScanResults)
-		return nil
+		r.markInterrupted(ctx, parentCtx)
+		return r.runDiff()
 	}
 }
 
@@ -1370,6 +1402,10 @@ func (r *Runner) handleHostPort(ctx context.Context, host, payload string, p *po
 
 		r.limiter.Take()
 		open, err := r.scanner.ConnectPort(host, payload, p, r.options.GetTimeout())
+		// A refused connection is still an answer from a live host; a timeout
+		// leaves reachability unproven. Zero open answers on a host whose
+		// probes all timed out marks it unreachable in the diff snapshot.
+		r.noteProbeResult(host, open || isProbeAnswered(err))
 		if open && err == nil {
 			r.scanner.ScanResults.AddPort(host, p)
 			// ignore OnReceive when verification is enabled
@@ -1461,7 +1497,7 @@ func (r *Runner) calculateDeadHosts(targets4, targets6 []*net.IPNet) {
 		checkCidr(cidr)
 	}
 
-	if deadCount := len(r.scanner.HostDiscoveryResults.GetDeadHosts()); deadCount > 0 {
+	if deadCount := len(r.scanner.HostDiscoveryResults.GetDeadHosts()); deadCount > 0 && r.options != nil && r.options.ShowDeadHosts {
 		gologger.Info().Msgf("%d of %d discovery targets did not respond\n", deadCount, total)
 	}
 }

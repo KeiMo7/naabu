@@ -127,6 +127,41 @@ func (r *Result) GetIPsPorts() chan *HostResult {
 	return out
 }
 
+// ForEachHostPorts streams a snapshot of the open ports per host without any
+// of the side effects of GetIPsPorts (no ARP lookups, no network calls). The
+// ports are copies, so the callback may keep them after the lock is released.
+// It is intended for side layers such as round-over-round diffing that must
+// stay cheap on very large result sets.
+func (r *Result) ForEachHostPorts(fn func(ip string, ports []*port.Port)) {
+	r.RLock()
+	snapshot := make(map[string][]*port.Port, len(r.ipPorts))
+	for ip, ports := range r.ipPorts {
+		hostPorts := make([]*port.Port, 0, len(ports))
+		for _, p := range ports {
+			hostPorts = append(hostPorts, copyPort(p))
+		}
+		snapshot[ip] = hostPorts
+	}
+	r.RUnlock()
+
+	for ip, ports := range snapshot {
+		fn(ip, ports)
+	}
+}
+
+// GetSkippedIPs returns the hosts that were not fully covered (for example a
+// port-threshold cut-off). The result is a copy, safe to keep.
+func (r *Result) GetSkippedIPs() []string {
+	r.RLock()
+	defer r.RUnlock()
+
+	out := make([]string, 0, len(r.skipped))
+	for ip := range r.skipped {
+		out = append(out, ip)
+	}
+	return out
+}
+
 // copyPort returns a copy of p that shares no memory with it, service info
 // included, so changes made through a snapshot never reach the stored port.
 func copyPort(p *port.Port) *port.Port {

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/projectdiscovery/naabu/v2/pkg/diff"
 	"github.com/projectdiscovery/naabu/v2/pkg/privileges"
 	"github.com/projectdiscovery/naabu/v2/pkg/result"
 	"github.com/projectdiscovery/naabu/v2/pkg/scan"
@@ -203,6 +204,25 @@ type Options struct {
 	// own raw socket, batch buffer and rate slice) used by the fast SYN sender.
 	// >1 overcomes the single-core send ceiling. Default 1 (unchanged behaviour).
 	TxWorkers int
+
+	// DiffBaseline is the path to a previous-round snapshot written with
+	// -diff-write. When set, the current scan is compared against it and a
+	// diff report is written to DiffOutput (or stdout). It never changes the
+	// scan itself or its single-round output.
+	DiffBaseline string
+	// DiffOutput is the path of the diff report (defaults to stdout when empty
+	// and a baseline is configured).
+	DiffOutput string
+	// DiffSnapshot is the path where this round's snapshot is written so a
+	// later run can use it as its baseline.
+	DiffSnapshot string
+
+	// diffBaseline is the baseline decoded during option validation, so a
+	// corrupt file fails before the scan and a large snapshot is not decoded
+	// twice. It is keyed by path; a caller that swaps DiffBaseline after
+	// validation falls back to reading the file in runDiff.
+	diffBaseline     *diff.Snapshot
+	diffBaselinePath string
 }
 
 // ParseOptions parses the command line flags provided by a user
@@ -321,6 +341,12 @@ func ParseOptions() *Options {
 		flagSet.BoolVarP(&options.NoPortPriority, "no-port-priority", "npp", false, "disable tiered port ordering (scan the whole range in one uniform random order)"),
 		flagSet.StringVar(&shardArg, "shard", "", "distributed scan slice as index/total, 1-based (e.g. 1/4)"),
 		flagSet.IntVar(&seedArg, "seed", 0, "seed for scan randomization, must match across shards (default random)"),
+	)
+
+	flagSet.CreateGroup("diff", "Round-over-round diff",
+		flagSet.StringVar(&options.DiffSnapshot, "diff-write", "", "write this round's snapshot to a file for later comparison"),
+		flagSet.StringVar(&options.DiffBaseline, "diff-baseline", "", "compare this round against a previous-round snapshot file"),
+		flagSet.StringVar(&options.DiffOutput, "diff-output", "", "write the diff report to this file (default: stdout)"),
 	)
 
 	flagSet.CreateGroup("debug", "Debug",
